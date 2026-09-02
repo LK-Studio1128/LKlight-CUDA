@@ -8,7 +8,7 @@
 
 use crate::dna::{DNA, DNADockingModel};
 use crate::grid_dna::{ReceptorField, CLOSE_DIST};
-use crate::qt::{rot3_apply, Quaternion};
+use crate::qt::Quaternion;
 
 /// GPU-ready receptor description: parameter arrays + 10 Å cell list (built once).
 pub struct CudaReceptor {
@@ -213,7 +213,7 @@ pub fn batch_energy_gpu_scores(
             r_heavy: *const u8, nr: i32,
             cell_start: *const i32, cell_atoms: *const i32,
             ncx: i32, ncy: i32, ncz: i32, c_ox: f32, c_oy: f32, c_oz: f32, c_sp: f32,
-            l_coords_all: *const f32, l_ele: *const f32, l_svdw: *const f32,
+            l_base: *const f32, poses: *const f64, l_ele: *const f32, l_svdw: *const f32,
             l_vdwr: *const f32, l_heavy: *const u8, nl: i32, n_pose: i32, out: *mut f64,
         ) -> i32;
     }
@@ -232,16 +232,25 @@ pub fn batch_energy_gpu_scores(
         return None;
     }
 
-    // CPU transform of all poses into one flat buffer.
-    let mut all = Vec::with_capacity(n_pose * nl * 3);
+    // Upload only the reference ligand coords (once per call, ~nl*3*4 B) plus
+    // N×7 pose parameters; the kernel rotates/translates on the device in f64.
+    // Previously we CPU-transformed N*nl*3 coords (~30 MB per step at n=200) —
+    // that host-side work and memcpy is now amortised into the kernel.
+    let base: Vec<f32> = dna
+        .ligand
+        .coordinates
+        .iter()
+        .flat_map(|c| c.iter().map(|&v| v as f32))
+        .collect();
+    let mut poses: Vec<f64> = Vec::with_capacity(n_pose * 7);
     for (t, r) in translations.iter().zip(rotations.iter()) {
-        let rm = r.to_matrix();
-        for c in dna.ligand.coordinates.iter() {
-            let v = rot3_apply(&rm, *c);
-            all.push((v[0] + t[0]) as f32);
-            all.push((v[1] + t[1]) as f32);
-            all.push((v[2] + t[2]) as f32);
-        }
+        poses.push(r.w);
+        poses.push(r.x);
+        poses.push(r.y);
+        poses.push(r.z);
+        poses.push(t[0]);
+        poses.push(t[1]);
+        poses.push(t[2]);
     }
     let le: Vec<f32> = dna.ligand.ele_charges.iter().map(|&q| q as f32).collect();
     let lsv: Vec<f32> = dna.ligand.sqrt_vdw_charges.iter().map(|&q| q as f32).collect();
@@ -258,7 +267,7 @@ pub fn batch_energy_gpu_scores(
             crec.r_vdwr.as_ptr(), crec.r_heavy.as_ptr(), (crec.r_coords.len() / 3) as i32,
             crec.cell_start.as_ptr(), crec.cell_atoms.as_ptr(),
             crec.ncx, crec.ncy, crec.ncz, crec.c_ox, crec.c_oy, crec.c_oz, crec.c_sp,
-            all.as_ptr(), le.as_ptr(), lsv.as_ptr(), lv.as_ptr(), lh.as_ptr(),
+            base.as_ptr(), poses.as_ptr(), le.as_ptr(), lsv.as_ptr(), lv.as_ptr(), lh.as_ptr(),
             nl as i32, n_pose as i32, out.as_mut_ptr(),
         )
     };

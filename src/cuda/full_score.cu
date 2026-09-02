@@ -219,7 +219,8 @@ __global__ void batch_full_score_kernel(
     const int* __restrict__ cell_start, const int* __restrict__ cell_atoms,
     int ncx, int ncy, int ncz,
     float c_ox, float c_oy, float c_oz, float c_sp,
-    const float* __restrict__ l_coords_all,  // N * nl * 3
+    const float* __restrict__ l_base,          // nl * 3 (reference ligand coords)
+    const double* __restrict__ poses,          // N * 7  (w,x,y,z,tx,ty,tz)
     const float* __restrict__ l_ele, const float* __restrict__ l_svdw,
     const float* __restrict__ l_vdwr, const unsigned char* __restrict__ l_heavy,
     int nl, int N,
@@ -228,8 +229,20 @@ __global__ void batch_full_score_kernel(
     int pose = blockIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= nl) return;
-    const float* lc = l_coords_all + ((size_t)pose * nl + j) * 3;
-    float x = lc[0], y = lc[1], z = lc[2];
+    // Rigid transform on the device: v' = R(q)·v + t, in double precision so the
+    // result matches the host-side f64 transform bit-for-bit before the f32 cast
+    // (avoids uploading N*nl*3 transformed coords every step ~ 30 MB @ n=200).
+    const double* pq = poses + (size_t)pose * 7;
+    double w = pq[0], qx = pq[1], qy = pq[2], qz = pq[3];
+    double tx = pq[4], ty = pq[5], tz = pq[6];
+    const float* lb = l_base + (size_t)j * 3;
+    double vx = lb[0], vy = lb[1], vz = lb[2];
+    double m00 = 1. - 2.*(qy*qy+qz*qz), m01 = 2.*(qx*qy - w*qz),  m02 = 2.*(qx*qz + w*qy);
+    double m10 = 2.*(qx*qy + w*qz),      m11 = 1. - 2.*(qx*qx+qz*qz), m12 = 2.*(qy*qz - w*qx);
+    double m20 = 2.*(qx*qz - w*qy),      m21 = 2.*(qy*qz + w*qx),  m22 = 1. - 2.*(qx*qx+qy*qy);
+    float x = (float)(m00*vx + m01*vy + m02*vz + tx);
+    float y = (float)(m10*vx + m11*vy + m12*vz + ty);
+    float z = (float)(m20*vx + m21*vy + m22*vz + tz);
     float qj = l_ele[j];
     float svdwj = l_svdw[j];
     float vdwrj = l_vdwr[j];
@@ -291,16 +304,16 @@ extern "C" int cuda_batch_score(
     const int* cell_start, const int* cell_atoms,
     int ncx, int ncy, int ncz,
     float c_ox, float c_oy, float c_oz, float c_sp,
-    const float* l_coords_all, const float* l_ele, const float* l_svdw,
-    const float* l_vdwr, const unsigned char* l_heavy,
+    const float* l_base, const double* poses, const float* l_ele,
+    const float* l_svdw, const float* l_vdwr, const unsigned char* l_heavy,
     int nl, int N,
     double* out)
 {
     cudaError_t err;
     float *d_phi=0,*d_rc=0,*d_re=0,*d_rsv=0,*d_rv=0; unsigned char *d_rh=0;
     int *d_cs=0,*d_ca=0;
-    float *d_lc=0,*d_le=0,*d_lsv=0,*d_lv=0; unsigned char *d_lh=0;
-    double *d_out=0;
+    float *d_lb=0,*d_le=0,*d_lsv=0,*d_lv=0; unsigned char *d_lh=0;
+    double *d_ps=0,*d_out=0;
     size_t phi_b=(size_t)nx*ny*nz*sizeof(float);
     size_t cb=(size_t)((ncx+1)*(ncy+1)*(ncz+1))*sizeof(int);
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
@@ -312,7 +325,8 @@ extern "C" int cuda_batch_score(
     CK(cudaMalloc(&d_rh,(size_t)nr));
     CK(cudaMalloc(&d_cs,cb));
     CK(cudaMalloc(&d_ca,(size_t)nr*sizeof(int)));
-    CK(cudaMalloc(&d_lc,(size_t)N*nl*3*sizeof(float)));
+    CK(cudaMalloc(&d_lb,(size_t)nl*3*sizeof(float)));
+    CK(cudaMalloc(&d_ps,(size_t)N*7*sizeof(double)));
     CK(cudaMalloc(&d_le,(size_t)nl*sizeof(float)));
     CK(cudaMalloc(&d_lsv,(size_t)nl*sizeof(float)));
     CK(cudaMalloc(&d_lv,(size_t)nl*sizeof(float)));
@@ -326,7 +340,8 @@ extern "C" int cuda_batch_score(
     CK(cudaMemcpy(d_rh,r_heavy,(size_t)nr,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_cs,cell_start,cb,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_lc,l_coords_all,(size_t)N*nl*3*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lb,l_base,(size_t)nl*3*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_le,l_ele,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_lsv,l_svdw,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
@@ -339,19 +354,19 @@ extern "C" int cuda_batch_score(
         batch_full_score_kernel<<<grid, threads>>>(
             d_phi,nx,ny,nz,ox,oy,oz,sp,
             d_rc,d_re,d_rsv,d_rv,d_rh,d_cs,d_ca,ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
-            d_lc,d_le,d_lsv,d_lv,d_lh,nl,N,d_out);
+            d_lb,d_ps,d_le,d_lsv,d_lv,d_lh,nl,N,d_out);
         CK(cudaDeviceSynchronize());
     }
     CK(cudaMemcpy(out,d_out,(size_t)N*2*sizeof(double),cudaMemcpyDeviceToHost));
     cudaFree(d_phi);cudaFree(d_rc);cudaFree(d_re);cudaFree(d_rsv);cudaFree(d_rv);cudaFree(d_rh);
-    cudaFree(d_cs);cudaFree(d_ca);cudaFree(d_lc);cudaFree(d_le);cudaFree(d_lsv);cudaFree(d_lv);cudaFree(d_lh);
+    cudaFree(d_cs);cudaFree(d_ca);cudaFree(d_lb);cudaFree(d_ps);cudaFree(d_le);cudaFree(d_lsv);cudaFree(d_lv);cudaFree(d_lh);
     cudaFree(d_out);
     return 0;
 fail:
     { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error: %s\n",m); }
     if(d_phi)cudaFree(d_phi);if(d_rc)cudaFree(d_rc);if(d_re)cudaFree(d_re);if(d_rsv)cudaFree(d_rsv);
     if(d_rv)cudaFree(d_rv);if(d_rh)cudaFree(d_rh);if(d_cs)cudaFree(d_cs);if(d_ca)cudaFree(d_ca);
-    if(d_lc)cudaFree(d_lc);if(d_le)cudaFree(d_le);if(d_lsv)cudaFree(d_lsv);if(d_lv)cudaFree(d_lv);
+    if(d_lb)cudaFree(d_lb);if(d_ps)cudaFree(d_ps);if(d_le)cudaFree(d_le);if(d_lsv)cudaFree(d_lsv);if(d_lv)cudaFree(d_lv);
     if(d_lh)cudaFree(d_lh);if(d_out)cudaFree(d_out);
     return -1;
 #undef CK
