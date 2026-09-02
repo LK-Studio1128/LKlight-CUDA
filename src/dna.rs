@@ -671,114 +671,106 @@ impl DNA {
         let lig_heavy = &self.ligand.heavy;
         let lig_slice: &[[f64; 3]] = lig_c.as_slice();
 
-        // Z-sorted ligand index (window ±CLOSE_DIST=10 Å for near pairs).
-        let mut lig_order: Vec<u32> = (0..lig_slice.len() as u32).collect();
-        lig_order.sort_unstable_by(|&a, &b| {
-            lig_slice[a as usize][2].partial_cmp(&lig_slice[b as usize][2]).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
         // Full-pose GPU fast path: near pairs + far field in one kernel.
-        // Used only when no restraints/membrane need interface flags (those
-        // stay on the CPU grid path). Any CUDA failure falls back below.
-        let need_iface_pre = !self.receptor.active_restraints.is_empty()
-            || !self.ligand.active_restraints.is_empty()
-            || !self.receptor.membrane.is_empty()
-            || !self.ligand.membrane.is_empty();
-        if !need_iface_pre {
-            let field_g = self.field.get_or_init(|| {
-                ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
-            });
-            let crec_g = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
-            if let Some((e_raw_g, v_g)) = full_energy_gpu(field_g, crec_g, lig_slice, &self.ligand) {
-                let total_elec_g = e_raw_g * FACTOR / EPSILON;
-                return -(total_elec_g + v_g);
-            }
-        }
-
-        // Near-pair energies (exact), far-field electrostatic from the grid.
-        let (e_near_raw, v_total) = rec_c.iter().enumerate()
-            .map(|(i, ra)| {
-                let rx = ra[0]; let ry = ra[1]; let rz = ra[2];
-                let mut ei = 0.0f64;
-                let mut vi = 0.0f64;
-                let zlo = rz - CLOSE_DIST;
-                let zhi = rz + CLOSE_DIST;
-                let mut lo = lig_order.partition_point(|&j| lig_slice[j as usize][2] < zlo);
-                let hi = lig_order.partition_point(|&j| lig_slice[j as usize][2] <= zhi);
-                while lo < hi {
-                    let j = lig_order[lo] as usize;
-                    lo += 1;
-                    let la = &lig_slice[j];
-                    let dx = rx - la[0];
-                    let dy = ry - la[1];
-                    let dz = rz - la[2];
-                    let d2 = dx*dx + dy*dy + dz*dz;
-                    if d2 <= CLOSE_DIST2 {
-                        let ae = (rec_ele[i] * lig_ele[j] / d2)
-                            .clamp(ELEC_MIN_CUTOFF, ELEC_MAX_CUTOFF);
-                        ei += ae;
-                    }
-                    if d2 <= VDW_DIST_CUTOFF2 {
-                        let vdw_e = rec_svdw[i] * lig_svdw[j];
-                        let vdw_r = rec_vdwr[i] + lig_vdwr[j];
-                        let p6 = vdw_r.powi(6) / d2.powi(3);
-                        let mut v_pair = (vdw_e * (p6*p6 - 2.0*p6)).min(VDW_CUTOFF);
-                        if rec_heavy[i] && lig_heavy[j] {
-                            let d = d2.sqrt();
-                            let dmin = CLASH_PENALTY_FRAC * vdw_r;
-                            if d < dmin {
-                                v_pair += CLASH_PENALTY_W * (dmin - d);
-                            }
-                        }
-                        vi += v_pair;
-                    }
-                }
-                (ei, vi)
-            })
-            .fold((0.0, 0.0), |(e1, v1), (e2, v2)| (e1+e2, v1+v2));
-
-        // Far field: build once, then Σ_j q_j·φ(x_j) — GPU first (feature `cuda`),
-        // transparent CPU fallback.
-        let field = self.field.get_or_init(|| {
-            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
-        });
-        let e_field_raw = crate::gpu_field::far_field_energy_gpu(field, lig_slice, lig_ele)
-            .unwrap_or_else(|| field.far_field_energy(lig_slice, lig_ele));
-
-        let total_elec_raw = e_near_raw + e_field_raw;
-        let total_elec = total_elec_raw * FACTOR / EPSILON;
-        let score = -(total_elec + v_total);
-
-        // Restraints / membrane need interface flags → cheap near-window pass.
+        // Only when no restraints/membrane need interface flags (those go to the
+        // exact path below). Any CUDA failure falls through to the CPU path.
         let need_iface = !self.receptor.active_restraints.is_empty()
             || !self.ligand.active_restraints.is_empty()
             || !self.receptor.membrane.is_empty()
             || !self.ligand.membrane.is_empty();
         if need_iface {
-            for (i, ra) in rec_c.iter().enumerate() {
-                let zlo = ra[2] - CLOSE_DIST;
-                let zhi = ra[2] + CLOSE_DIST;
-                let mut lo = lig_order.partition_point(|&j| lig_slice[j as usize][2] < zlo);
-                let hi = lig_order.partition_point(|&j| lig_slice[j as usize][2] <= zhi);
-                while lo < hi {
-                    let j = lig_order[lo] as usize;
-                    lo += 1;
-                    let la = &lig_slice[j];
-                    let d2 = (ra[0]-la[0]).powi(2) + (ra[1]-la[1]).powi(2) + (ra[2]-la[2]).powi(2);
-                    if d2 <= INTERFACE_CUTOFF2 {
-                        iface_r[i] = 1;
-                        iface_l[j] = 1;
+            return self.energy_exact(translation, rotation, rec_nmodes, lig_nmodes);
+        }
+        let field = self.field.get_or_init(|| {
+            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+        });
+        {
+            let crec_g = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
+            if let Some((e_raw_g, v_g)) = full_energy_gpu(field, crec_g, lig_slice, &self.ligand) {
+                let total_elec_g = e_raw_g * FACTOR / EPSILON;
+                return -(total_elec_g + v_g);
+            }
+        }
+
+        // CPU near pairs via the receptor cell list (10 Å cells, built once and
+        // shared with the CUDA path): each ligand atom scans its 27 surrounding
+        // cells. On an elongated ligand (a ~1300 Å RNA against a 120 Å receptor)
+        // this tests far fewer candidate pairs than the old receptor-scan-ligand
+        // Z-window, and needs no per-call Z sorting. Same pairs, same formulas →
+        // bit-for-bit-equivalent scores up to f64 summation order.
+        let crec = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
+        let (e_near_raw, v_total) = {
+            let mut e_sum = 0.0f64;
+            let mut v_sum = 0.0f64;
+            let csp = crec.c_sp as f64;
+            let cox = crec.c_ox as f64;
+            let coy = crec.c_oy as f64;
+            let coz = crec.c_oz as f64;
+            for (j, la) in lig_slice.iter().enumerate() {
+                let x = la[0];
+                let y = la[1];
+                let z = la[2];
+                let qj = lig_ele[j];
+                let svdwj = lig_svdw[j];
+                let vdwrj = lig_vdwr[j];
+                let hj = lig_heavy[j];
+                let cxi = ((((x - cox) / csp).floor() as i64).clamp(0, crec.ncx as i64 - 1)) as i64;
+                let cyi = ((((y - coy) / csp).floor() as i64).clamp(0, crec.ncy as i64 - 1)) as i64;
+                let czi = ((((z - coz) / csp).floor() as i64).clamp(0, crec.ncz as i64 - 1)) as i64;
+                let ncy_ = crec.ncy as i64;
+                let ncx_ = crec.ncx as i64;
+                for dz in -1..=1i64 {
+                    let iz = czi + dz;
+                    if iz < 0 || iz >= crec.ncz as i64 { continue; }
+                    for dy in -1..=1i64 {
+                        let iy = cyi + dy;
+                        if iy < 0 || iy >= ncy_ { continue; }
+                        for dx in -1..=1i64 {
+                            let ix = cxi + dx;
+                            if ix < 0 || ix >= ncx_ { continue; }
+                            let cell = ((iz * ncy_ + iy) * ncx_ + ix) as usize;
+                            let b = crec.cell_start[cell] as usize;
+                            let e = crec.cell_start[cell + 1] as usize;
+                            for p in b..e {
+                                let i = crec.cell_atoms[p] as usize;
+                                let dx = x - rec_c[i][0];
+                                let dy = y - rec_c[i][1];
+                                let dz = z - rec_c[i][2];
+                                let d2 = dx*dx + dy*dy + dz*dz;
+                                if d2 <= CLOSE_DIST2 {
+                                    let ae = (qj * rec_ele[i] / d2)
+                                        .clamp(ELEC_MIN_CUTOFF, ELEC_MAX_CUTOFF);
+                                    e_sum += ae;
+                                }
+                                if d2 <= VDW_DIST_CUTOFF2 {
+                                    let vdw_e = svdwj * rec_svdw[i];
+                                    let vdw_r = vdwrj + rec_vdwr[i];
+                                    let p6 = vdw_r.powi(6) / d2.powi(3);
+                                    let mut v_pair = (vdw_e * (p6*p6 - 2.0*p6)).min(VDW_CUTOFF);
+                                    if hj && rec_heavy[i] {
+                                        let d = d2.sqrt();
+                                        let dmin = CLASH_PENALTY_FRAC * vdw_r;
+                                        if d < dmin {
+                                            v_pair += CLASH_PENALTY_W * (dmin - d);
+                                        }
+                                    }
+                                    v_sum += v_pair;
+                                }
+                            }
+                        }
                     }
                 }
             }
-            let perc_r = satisfied_restraints(iface_r, &self.receptor.active_restraints);
-            let perc_l = satisfied_restraints(iface_l, &self.ligand.active_restraints);
-            let intersection = membrane_intersection(iface_r, &self.receptor.membrane);
-            let penalty = if intersection > 0.0 { MEMBRANE_PENALTY_SCORE * intersection } else { 0.0 };
-            score + perc_r * score + perc_l * score - penalty
-        } else {
-            score
-        }
+            (e_sum, v_sum)
+        };
+
+        // Far field (10-30 Å electrostatics): Σ_j q_j·φ(x_j).
+        let e_field_raw = crate::gpu_field::far_field_energy_gpu(field, lig_slice, lig_ele)
+            .unwrap_or_else(|| field.far_field_energy(lig_slice, lig_ele));
+
+        let total_elec_raw = e_near_raw + e_field_raw;
+        let total_elec = total_elec_raw * FACTOR / EPSILON;
+        -(total_elec + v_total)
         })
     }
 }
