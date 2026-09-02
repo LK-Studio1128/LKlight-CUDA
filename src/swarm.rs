@@ -68,6 +68,37 @@ impl<'a> Swarm<'a> {
     }
 
     pub fn update_luciferin(&mut self) {
+        if self.glowworms.is_empty() {
+            return;
+        }
+        // Batched GPU path (DNA + CUDA device): score all moved glowworms in a
+        // single kernel launch, then update luciferin/step with identical
+        // semantics to compute_luciferin. Non-batch scorers keep the rayon
+        // per-glowworm path unchanged.
+        if self.glowworms[0].scoring_function.supports_batch() {
+            let need: Vec<usize> = self
+                .glowworms
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| g.moved || g.step == 0)
+                .map(|(i, _)| i)
+                .collect();
+            if !need.is_empty() {
+                let tr: Vec<[f64; 3]> = need.iter().map(|&i| self.glowworms[i].translation).collect();
+                let ro: Vec<Quaternion> = need.iter().map(|&i| self.glowworms[i].rotation).collect();
+                let scores = self.glowworms[0].scoring_function.batch_energy(&tr, &ro);
+                for (k, &i) in need.iter().enumerate() {
+                    if k < scores.len() {
+                        self.glowworms[i].scoring = scores[k];
+                    }
+                }
+            }
+            for g in self.glowworms.iter_mut() {
+                g.luciferin = (1.0 - g.rho) * g.luciferin + g.gamma * g.scoring;
+                g.step += 1;
+            }
+            return;
+        }
         self.glowworms.par_iter_mut().for_each(|gw| gw.compute_luciferin());
     }
 

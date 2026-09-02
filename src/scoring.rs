@@ -47,6 +47,22 @@ pub trait Score: Send + Sync {
     ) -> f64 {
         self.energy(translation, rotation, rec_nmodes, lig_nmodes)
     }
+
+    /// Whether the scorer can evaluate many poses in one batched call
+    /// (used by GPU back-ends to amortise launch/sync overhead).
+    fn supports_batch(&self) -> bool {
+        false
+    }
+
+    /// Evaluate one energy per pose. Default implementation falls back to
+    /// per-pose `energy` calls, so non-batched scorers behave exactly as before.
+    fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        translations
+            .iter()
+            .zip(rotations.iter())
+            .map(|(t, r)| self.energy(t, r, &[], &[]))
+            .collect()
+    }
 }
 
 pub fn satisfied_restraints(interface: &[usize], restraints: &HashMap<String, Vec<usize>>) -> f64 {

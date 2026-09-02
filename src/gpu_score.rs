@@ -6,8 +6,9 @@
 //! thread per ligand atom over a receptor cell list. Any failure falls back to
 //! the CPU grid path, so docking never breaks without CUDA.
 
-use crate::dna::DNADockingModel;
+use crate::dna::{DNA, DNADockingModel};
 use crate::grid_dna::{ReceptorField, CLOSE_DIST};
+use crate::qt::{rot3_apply, Quaternion};
 
 /// GPU-ready receptor description: parameter arrays + 10 Å cell list (built once).
 pub struct CudaReceptor {
@@ -175,5 +176,116 @@ pub fn full_energy_gpu(
     _lig_coords: &[[f64; 3]],
     _lig: &DNADockingModel,
 ) -> Option<(f64, f64)> {
+    None
+}
+
+/// True when a usable CUDA device is present (drives `supports_batch`).
+#[cfg(feature = "cuda")]
+pub fn cuda_available() -> bool {
+    extern "C" {
+        fn cudaGetDeviceCount(count: *mut i32) -> i32;
+    }
+    let mut n: i32 = 0;
+    unsafe { cudaGetDeviceCount(&mut n) == 0 && n > 0 }
+}
+
+/// Non-CUDA build: no GPU.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_available() -> bool {
+    false
+}
+
+/// Score many poses in one batched GPU kernel launch (near pairs + far field).
+/// The host transforms ligand coordinates for every pose (cheap) and uploads a
+/// single N×nl×3 buffer; one kernel with gridDim.y = N returns per-pose scores.
+/// Returns `None` on any failure so the caller falls back to per-pose CPU.
+#[cfg(feature = "cuda")]
+pub fn batch_energy_gpu_scores(
+    dna: &DNA,
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
+    extern "C" {
+        #[allow(clippy::too_many_arguments)]
+        fn cuda_batch_score(
+            phi: *const f32, nx: i32, ny: i32, nz: i32, ox: f32, oy: f32, oz: f32, sp: f32,
+            r_coords: *const f32, r_ele: *const f32, r_svdw: *const f32, r_vdwr: *const f32,
+            r_heavy: *const u8, nr: i32,
+            cell_start: *const i32, cell_atoms: *const i32,
+            ncx: i32, ncy: i32, ncz: i32, c_ox: f32, c_oy: f32, c_oz: f32, c_sp: f32,
+            l_coords_all: *const f32, l_ele: *const f32, l_svdw: *const f32,
+            l_vdwr: *const f32, l_heavy: *const u8, nl: i32, n_pose: i32, out: *mut f64,
+        ) -> i32;
+    }
+    let n_pose = translations.len();
+    let nl = dna.ligand.coordinates.len();
+    if n_pose == 0 || nl == 0 {
+        return None;
+    }
+    let field = dna.field.get_or_init(|| {
+        ReceptorField::build(&dna.receptor.coordinates, &dna.receptor.ele_charges)
+    });
+    let crec = dna
+        .rec_cuda
+        .get_or_init(|| CudaReceptor::build(&dna.receptor));
+    if field.phi.is_empty() {
+        return None;
+    }
+
+    // CPU transform of all poses into one flat buffer.
+    let mut all = Vec::with_capacity(n_pose * nl * 3);
+    for (t, r) in translations.iter().zip(rotations.iter()) {
+        let rm = r.to_matrix();
+        for c in dna.ligand.coordinates.iter() {
+            let v = rot3_apply(&rm, *c);
+            all.push((v[0] + t[0]) as f32);
+            all.push((v[1] + t[1]) as f32);
+            all.push((v[2] + t[2]) as f32);
+        }
+    }
+    let le: Vec<f32> = dna.ligand.ele_charges.iter().map(|&q| q as f32).collect();
+    let lsv: Vec<f32> = dna.ligand.sqrt_vdw_charges.iter().map(|&q| q as f32).collect();
+    let lv: Vec<f32> = dna.ligand.vdw_radii.iter().map(|&r| r as f32).collect();
+    let lh: Vec<u8> = dna.ligand.heavy.iter().map(|&h| h as u8).collect();
+    let mut out = vec![0.0f64; n_pose * 2];
+
+    let ret = unsafe {
+        cuda_batch_score(
+            field.phi.as_ptr(), field.n[0] as i32, field.n[1] as i32, field.n[2] as i32,
+            field.origin[0] as f32, field.origin[1] as f32, field.origin[2] as f32,
+            field.spacing as f32,
+            crec.r_coords.as_ptr(), crec.r_ele.as_ptr(), crec.r_svdw.as_ptr(),
+            crec.r_vdwr.as_ptr(), crec.r_heavy.as_ptr(), (crec.r_coords.len() / 3) as i32,
+            crec.cell_start.as_ptr(), crec.cell_atoms.as_ptr(),
+            crec.ncx, crec.ncy, crec.ncz, crec.c_ox, crec.c_oy, crec.c_oz, crec.c_sp,
+            all.as_ptr(), le.as_ptr(), lsv.as_ptr(), lv.as_ptr(), lh.as_ptr(),
+            nl as i32, n_pose as i32, out.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("[gpu_score] CUDA BATCH scoring ACTIVE ({} poses × {} atoms)",
+                  n_pose, nl);
+    }
+    const FACTOR: f64 = 332.0;
+    const EPSILON: f64 = 4.0;
+    Some(
+        (0..n_pose)
+            .map(|k| -(out[2 * k] * FACTOR / EPSILON + out[2 * k + 1]))
+            .collect(),
+    )
+}
+
+/// Non-CUDA build / GPU failure → caller falls back to per-pose CPU.
+#[cfg(not(feature = "cuda"))]
+pub fn batch_energy_gpu_scores(
+    _dna: &DNA,
+    _translations: &[[f64; 3]],
+    _rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
     None
 }

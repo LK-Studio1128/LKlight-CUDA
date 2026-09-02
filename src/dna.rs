@@ -407,6 +407,8 @@ pub struct DNA {
     pub field: OnceLock<ReceptorField>,
     /// Lazily-built receptor CUDA cell-list description (GPU near-pair scoring).
     pub rec_cuda: OnceLock<CudaReceptor>,
+    /// Once-probed GPU availability (drives `supports_batch`).
+    pub gpu_state: OnceLock<bool>,
 }
 
 impl<'a> DNA {
@@ -442,6 +444,7 @@ impl<'a> DNA {
             use_anm,
             field: OnceLock::new(),
             rec_cuda: OnceLock::new(),
+            gpu_state: OnceLock::new(),
         };
         Box::new(d)
     }
@@ -811,6 +814,32 @@ impl Score for DNA {
         lig_nmodes: &[f64],
     ) -> f64 {
         DNA::energy_grid(self, translation, rotation, rec_nmodes, lig_nmodes)
+    }
+
+    fn supports_batch(&self) -> bool {
+        if self.use_anm {
+            return false;
+        }
+        *self
+            .gpu_state
+            .get_or_init(|| crate::gpu_score::cuda_available())
+    }
+
+    fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        if !self.use_anm {
+            if let Some(scores) = crate::gpu_score::batch_energy_gpu_scores(
+                self,
+                translations,
+                rotations,
+            ) {
+                return scores;
+            }
+        }
+        translations
+            .iter()
+            .zip(rotations.iter())
+            .map(|(t, r)| self.energy_grid(t, r, &[], &[]))
+            .collect()
     }
 }
 

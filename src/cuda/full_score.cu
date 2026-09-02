@@ -205,3 +205,154 @@ fail:
     return -1;
 #undef CK
 }
+
+// ── batched variant ─────────────────────────────────────────────────────────
+// gridDim = (blocks over ligand atoms, pose index). One kernel launch scores N
+// poses: amortises launch + host-device traffic; this is what makes the GPU win
+// (per-pose launches pay ~18 ms sync each and lose to the CPU grid path).
+__global__ void batch_full_score_kernel(
+    const float* __restrict__ phi, int nx, int ny, int nz,
+    float ox, float oy, float oz, float sp,
+    const float* __restrict__ r_coords, const float* __restrict__ r_ele,
+    const float* __restrict__ r_svdw, const float* __restrict__ r_vdwr,
+    const unsigned char* __restrict__ r_heavy,
+    const int* __restrict__ cell_start, const int* __restrict__ cell_atoms,
+    int ncx, int ncy, int ncz,
+    float c_ox, float c_oy, float c_oz, float c_sp,
+    const float* __restrict__ l_coords_all,  // N * nl * 3
+    const float* __restrict__ l_ele, const float* __restrict__ l_svdw,
+    const float* __restrict__ l_vdwr, const unsigned char* __restrict__ l_heavy,
+    int nl, int N,
+    double* __restrict__ out)                 // N * 2  (elec, vdw)
+{
+    int pose = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= nl) return;
+    const float* lc = l_coords_all + ((size_t)pose * nl + j) * 3;
+    float x = lc[0], y = lc[1], z = lc[2];
+    float qj = l_ele[j];
+    float svdwj = l_svdw[j];
+    float vdwrj = l_vdwr[j];
+    bool hj = l_heavy[j] != 0;
+    float elec = 0.f, vdw = 0.f;
+    if (qj != 0.f)
+        elec += qj * sample_phi_f(phi, nx, ny, nz, ox, oy, oz, sp, x, y, z);
+    int cxi = (int)floorf((x - c_ox) / c_sp);
+    int cyi = (int)floorf((y - c_oy) / c_sp);
+    int czi = (int)floorf((z - c_oz) / c_sp);
+    for (int dz = -1; dz <= 1; ++dz) {
+        int czz = czi + dz;
+        if (czz < 0 || czz >= ncz) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            int cyy = cyi + dy;
+            if (cyy < 0 || cyy >= ncy) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int cxx = cxi + dx;
+                if (cxx < 0 || cxx >= ncx) continue;
+                int cell = (czz * ncy + cyy) * ncx + cxx;
+                int b = cell_start[cell], e = cell_start[cell + 1];
+                for (int p = b; p < e; ++p) {
+                    int i = cell_atoms[p];
+                    float dxf = x - r_coords[i*3];
+                    float dyf = y - r_coords[i*3+1];
+                    float dzf = z - r_coords[i*3+2];
+                    float d2 = dxf*dxf + dyf*dyf + dzf*dzf;
+                    if (d2 <= NEAR2) {
+                        float ae = qj * r_ele[i] / d2;
+                        if (ae > ES_CAP) ae = ES_CAP;
+                        else if (ae < -ES_CAP) ae = -ES_CAP;
+                        elec += ae;
+                        float sv = svdwj * r_svdw[i];
+                        float rr = vdwrj + r_vdwr[i];
+                        float rr2 = rr * rr;
+                        float p6 = rr2 * rr2 * rr2 / (d2 * d2 * d2);
+                        float vp = sv * (p6*p6 - 2.0f*p6);
+                        if (vp > LJ_CAP) vp = LJ_CAP;
+                        if (hj && r_heavy[i]) {
+                            float d = sqrtf(d2);
+                            float dmin = CP_F * rr;
+                            if (d < dmin) vp += CP_W * (dmin - d);
+                        }
+                        vdw += vp;
+                    }
+                }
+            }
+        }
+    }
+    atomicAdd(&out[(size_t)pose * 2], (double)elec);
+    atomicAdd(&out[(size_t)pose * 2 + 1], (double)vdw);
+}
+
+extern "C" int cuda_batch_score(
+    const float* phi, int nx, int ny, int nz,
+    float ox, float oy, float oz, float sp,
+    const float* r_coords, const float* r_ele, const float* r_svdw,
+    const float* r_vdwr, const unsigned char* r_heavy, int nr,
+    const int* cell_start, const int* cell_atoms,
+    int ncx, int ncy, int ncz,
+    float c_ox, float c_oy, float c_oz, float c_sp,
+    const float* l_coords_all, const float* l_ele, const float* l_svdw,
+    const float* l_vdwr, const unsigned char* l_heavy,
+    int nl, int N,
+    double* out)
+{
+    cudaError_t err;
+    float *d_phi=0,*d_rc=0,*d_re=0,*d_rsv=0,*d_rv=0; unsigned char *d_rh=0;
+    int *d_cs=0,*d_ca=0;
+    float *d_lc=0,*d_le=0,*d_lsv=0,*d_lv=0; unsigned char *d_lh=0;
+    double *d_out=0;
+    size_t phi_b=(size_t)nx*ny*nz*sizeof(float);
+    size_t cb=(size_t)((ncx+1)*(ncy+1)*(ncz+1))*sizeof(int);
+#define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
+    CK(cudaMalloc(&d_phi,phi_b));
+    CK(cudaMalloc(&d_rc,(size_t)nr*3*sizeof(float)));
+    CK(cudaMalloc(&d_re,(size_t)nr*sizeof(float)));
+    CK(cudaMalloc(&d_rsv,(size_t)nr*sizeof(float)));
+    CK(cudaMalloc(&d_rv,(size_t)nr*sizeof(float)));
+    CK(cudaMalloc(&d_rh,(size_t)nr));
+    CK(cudaMalloc(&d_cs,cb));
+    CK(cudaMalloc(&d_ca,(size_t)nr*sizeof(int)));
+    CK(cudaMalloc(&d_lc,(size_t)N*nl*3*sizeof(float)));
+    CK(cudaMalloc(&d_le,(size_t)nl*sizeof(float)));
+    CK(cudaMalloc(&d_lsv,(size_t)nl*sizeof(float)));
+    CK(cudaMalloc(&d_lv,(size_t)nl*sizeof(float)));
+    CK(cudaMalloc(&d_lh,(size_t)nl));
+    CK(cudaMalloc(&d_out,(size_t)N*2*sizeof(double)));
+    CK(cudaMemcpy(d_phi,phi,phi_b,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_rc,r_coords,(size_t)nr*3*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_re,r_ele,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_rsv,r_svdw,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_rv,r_vdwr,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_rh,r_heavy,(size_t)nr,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_cs,cell_start,cb,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lc,l_coords_all,(size_t)N*nl*3*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_le,l_ele,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lsv,l_svdw,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lh,l_heavy,(size_t)nl,cudaMemcpyHostToDevice));
+    CK(cudaMemset(d_out,0,(size_t)N*2*sizeof(double)));
+    {
+        int threads = 256;
+        int bx = (nl + threads - 1) / threads;
+        dim3 grid(bx, N);
+        batch_full_score_kernel<<<grid, threads>>>(
+            d_phi,nx,ny,nz,ox,oy,oz,sp,
+            d_rc,d_re,d_rsv,d_rv,d_rh,d_cs,d_ca,ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
+            d_lc,d_le,d_lsv,d_lv,d_lh,nl,N,d_out);
+        CK(cudaDeviceSynchronize());
+    }
+    CK(cudaMemcpy(out,d_out,(size_t)N*2*sizeof(double),cudaMemcpyDeviceToHost));
+    cudaFree(d_phi);cudaFree(d_rc);cudaFree(d_re);cudaFree(d_rsv);cudaFree(d_rv);cudaFree(d_rh);
+    cudaFree(d_cs);cudaFree(d_ca);cudaFree(d_lc);cudaFree(d_le);cudaFree(d_lsv);cudaFree(d_lv);cudaFree(d_lh);
+    cudaFree(d_out);
+    return 0;
+fail:
+    { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error: %s\n",m); }
+    if(d_phi)cudaFree(d_phi);if(d_rc)cudaFree(d_rc);if(d_re)cudaFree(d_re);if(d_rsv)cudaFree(d_rsv);
+    if(d_rv)cudaFree(d_rv);if(d_rh)cudaFree(d_rh);if(d_cs)cudaFree(d_cs);if(d_ca)cudaFree(d_ca);
+    if(d_lc)cudaFree(d_lc);if(d_le)cudaFree(d_le);if(d_lsv)cudaFree(d_lsv);if(d_lv)cudaFree(d_lv);
+    if(d_lh)cudaFree(d_lh);if(d_out)cudaFree(d_out);
+    return -1;
+#undef CK
+}
