@@ -16,6 +16,7 @@ pub mod gpu_score;
 pub mod grid_dna;
 pub mod lr_sasa;
 pub mod mj3h;
+pub mod nearcell;
 pub mod pisa;
 pub mod pydock;
 pub mod qt;

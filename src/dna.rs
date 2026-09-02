@@ -671,20 +671,20 @@ impl DNA {
         let lig_heavy = &self.ligand.heavy;
         let lig_slice: &[[f64; 3]] = lig_c.as_slice();
 
-        // Full-pose GPU fast path: near pairs + far field in one kernel.
-        // Only when no restraints/membrane need interface flags (those go to the
-        // exact path below). Any CUDA failure falls through to the CPU path.
+        // Restraints/membrane need per-atom interface flags. The cell near pass
+        // below enumerates every pair ≤ 10 Å — the same pair set that defines
+        // the interface (INTERFACE_CUTOFF < 10 Å) — so flags are collected there
+        // and restraint/membrane runs keep the grid path instead of falling back
+        // to the 30 Å all-vs-all scan. The GPU kernel does not return the flags,
+        // so restraint/membrane runs use the CPU cell path.
         let need_iface = !self.receptor.active_restraints.is_empty()
             || !self.ligand.active_restraints.is_empty()
             || !self.receptor.membrane.is_empty()
             || !self.ligand.membrane.is_empty();
-        if need_iface {
-            return self.energy_exact(translation, rotation, rec_nmodes, lig_nmodes);
-        }
         let field = self.field.get_or_init(|| {
             ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
         });
-        {
+        if !need_iface {
             let crec_g = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
             if let Some((e_raw_g, v_g)) = full_energy_gpu(field, crec_g, lig_slice, &self.ligand) {
                 let total_elec_g = e_raw_g * FACTOR / EPSILON;
@@ -756,6 +756,10 @@ impl DNA {
                                     }
                                     v_sum += v_pair;
                                 }
+                                if d2 <= INTERFACE_CUTOFF2 {
+                                    iface_r[i] = 1;
+                                    iface_l[j] = 1;
+                                }
                             }
                         }
                     }
@@ -770,7 +774,15 @@ impl DNA {
 
         let total_elec_raw = e_near_raw + e_field_raw;
         let total_elec = total_elec_raw * FACTOR / EPSILON;
-        -(total_elec + v_total)
+        let mut score = -(total_elec + v_total);
+        if need_iface {
+            let perc_r = satisfied_restraints(iface_r, &self.receptor.active_restraints);
+            let perc_l = satisfied_restraints(iface_l, &self.ligand.active_restraints);
+            let intersection = membrane_intersection(iface_r, &self.receptor.membrane);
+            let penalty = if intersection > 0.0 { MEMBRANE_PENALTY_SCORE * intersection } else { 0.0 };
+            score += perc_r * score + perc_l * score - penalty;
+        }
+        score
         })
     }
 }

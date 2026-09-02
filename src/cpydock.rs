@@ -24,6 +24,9 @@ use super::constants::{INTERFACE_CUTOFF2, MEMBRANE_PENALTY_SCORE};
 use super::lr_sasa::lee_richards_sasa;
 use super::qt::{rot3_apply, Quaternion};
 use super::scoring::{membrane_intersection, satisfied_restraints, Score};
+use crate::grid_dna::ReceptorField;
+use crate::nearcell::NearCells;
+use std::sync::OnceLock;
 use log::{info, warn};
 use pdbtbx::PDB;
 use std::cell::RefCell;
@@ -339,6 +342,8 @@ pub struct CPYDOCK {
     pub receptor: CPYDOCKDockingModel,
     pub ligand: CPYDOCKDockingModel,
     pub use_anm: bool,
+    cells: OnceLock<NearCells>,
+    field: OnceLock<ReceptorField>,
 }
 
 impl CPYDOCK {
@@ -359,12 +364,14 @@ impl CPYDOCK {
             receptor: CPYDOCKDockingModel::new(&receptor, &rec_active, &rec_passive, &rec_nmodes, rec_num_anm),
             ligand:   CPYDOCKDockingModel::new(&ligand,   &lig_active, &lig_passive, &lig_nmodes, lig_num_anm),
             use_anm,
+            cells: OnceLock::new(),
+            field: OnceLock::new(),
         })
     }
 }
 
-impl Score for CPYDOCK {
-    fn energy(
+impl CPYDOCK {
+    fn energy_exact(
         &self,
         translation: &[f64],
         rotation: &Quaternion,
@@ -530,5 +537,141 @@ impl Score for CPYDOCK {
 
             score + perc_r * score + perc_l * score - penalty
         })
+    }
+}
+
+impl CPYDOCK {
+    pub fn energy_grid(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        if self.use_anm || !rec_nmodes.is_empty() || !lig_nmodes.is_empty() {
+            return self.energy_exact(translation, rotation, rec_nmodes, lig_nmodes);
+        }
+        let rot_mat = rotation.to_matrix();
+        let field = self.field.get_or_init(|| {
+            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+        });
+        let cells = self.cells.get_or_init(|| NearCells::build(&self.receptor.coordinates, 10.0));
+        thread_local! {
+            static SCRATCH: RefCell<(
+                Vec<[f64; 3]>, Vec<[f64; 3]>,
+                Vec<usize>, Vec<usize>,
+                Vec<f64>, Vec<f64>,
+            )> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        SCRATCH.with(|sc| {
+            let mut sc = sc.borrow_mut();
+            let (rec_c, lig_c, iface_r, iface_l, min_rec, min_lig) = &mut *sc;
+            let rec_n = self.receptor.coordinates.len();
+            let lig_n = self.ligand.coordinates.len();
+            if rec_c.len() != rec_n { rec_c.resize(rec_n, [0.0; 3]); }
+            if lig_c.len() != lig_n { lig_c.resize(lig_n, [0.0; 3]); }
+            if iface_r.len() != rec_n { iface_r.resize(rec_n, 0); }
+            if iface_l.len() != lig_n { iface_l.resize(lig_n, 0); }
+            if min_rec.len() != rec_n { min_rec.resize(rec_n, 0.0); }
+            if min_lig.len() != lig_n { min_lig.resize(lig_n, 0.0); }
+            rec_c.copy_from_slice(&self.receptor.coordinates);
+            lig_c.copy_from_slice(&self.ligand.coordinates);
+            for v in iface_r.iter_mut() { *v = 0; }
+            for v in iface_l.iter_mut() { *v = 0; }
+            const HUGE: f64 = 10000.0;
+            for v in min_rec.iter_mut() { *v = HUGE; }
+            for v in min_lig.iter_mut() { *v = HUGE; }
+            for coord in lig_c.iter_mut() {
+                let r = rot3_apply(&rot_mat, *coord);
+                coord[0] = r[0] + translation[0];
+                coord[1] = r[1] + translation[1];
+                coord[2] = r[2] + translation[2];
+            }
+            let lig_slice: &[[f64; 3]] = lig_c.as_slice();
+            let rec_ele  = &self.receptor.ele_charges;
+            let lig_ele  = &self.ligand.ele_charges;
+            let rec_vdwq = &self.receptor.vdw_charges;
+            let lig_vdwq = &self.ligand.vdw_charges;
+            let rec_vdwr = &self.receptor.vdw_radii;
+            let lig_vdwr = &self.ligand.vdw_radii;
+            let rec_hyd  = &self.receptor.hydrogens;
+            let lig_hyd  = &self.ligand.hydrogens;
+            let rec_flag = |i: usize| -> bool { if i % 2 == 0 { rec_hyd[i / 2] != 0 } else { false } };
+            let lig_flag = |j: usize| -> bool { if j % 2 == 0 { lig_hyd[j / 2] != 0 } else { false } };
+            let mut e_near_raw = 0.0f64;
+            let mut total_vdw = 0.0f64;
+            for (j, la) in lig_slice.iter().enumerate() {
+                let x = la[0]; let y = la[1]; let z = la[2];
+                let qj = lig_ele[j];
+                let vdwqj = lig_vdwq[j];
+                let vdwrj = lig_vdwr[j];
+                let lf = lig_flag(j);
+                cells.for_each_near(x, y, z, &mut |i| {
+                    let dx = x - rec_c[i][0];
+                    let dy = y - rec_c[i][1];
+                    let dz = z - rec_c[i][2];
+                    let d2 = dx*dx + dy*dy + dz*dz;
+                    if !rec_flag(i) && !lf {
+                        if d2 < min_rec[i] { min_rec[i] = d2; }
+                        if d2 < min_lig[j] { min_lig[j] = d2; }
+                    }
+                    if d2 <= VDW_DIST_CUTOFF2 {
+                        let ae = (qj * rec_ele[i] / d2).clamp(ELEC_MIN_CUTOFF, ELEC_MAX_CUTOFF);
+                        e_near_raw += ae;
+                        let vdw_e = (vdwqj * rec_vdwq[i]).sqrt();
+                        let vdw_r = vdwrj + rec_vdwr[i];
+                        let p6 = vdw_r.powf(6.0) / d2.powf(3.0);
+                        let k = vdw_e * (p6*p6 - 2.0*p6);
+                        total_vdw += if k > VDW_CUTOFF { VDW_CUTOFF } else { k };
+                    }
+                    if d2 <= INTERFACE_CUTOFF2 {
+                        iface_r[i] = 1;
+                        iface_l[j] = 1;
+                    }
+                });
+            }
+            let e_field_raw = field.far_field_energy(lig_slice, lig_ele);
+            let total_elec_raw = e_near_raw + e_field_raw;
+            let total_elec_kcal = total_elec_raw * FACTOR / EPSILON;
+            let rec_asa = &self.receptor.asa;
+            let lig_asa = &self.ligand.asa;
+            let rec_des = &self.receptor.des_energy;
+            let lig_des = &self.ligand.des_energy;
+            let mut total_solv = 0.0_f64;
+            for i in 0..rec_n {
+                let mut solv_rec = 0.0;
+                if min_rec[i] <= SOLVATION_DISTANCE2 && min_rec[i] > 0.0 && rec_asa[i] > 0.0 {
+                    solv_rec = -10.0 * min_rec[i].sqrt() + 65.0;
+                }
+                if solv_rec > rec_asa[i] { solv_rec = rec_asa[i]; }
+                total_solv += solv_rec * rec_des[i];
+            }
+            for j in 0..lig_n {
+                let mut solv_lig = 0.0;
+                if min_lig[j] <= SOLVATION_DISTANCE2 && min_lig[j] > 0.0 && lig_asa[j] > 0.0 {
+                    solv_lig = -10.0 * min_lig[j].sqrt() + 65.0;
+                }
+                if solv_lig > lig_asa[j] { solv_lig = lig_asa[j]; }
+                total_solv += solv_lig * lig_des[j];
+            }
+            let score = (total_elec_kcal + VDW_WEIGHT * total_vdw - total_solv) * -1.0;
+            let perc_r = satisfied_restraints(iface_r, &self.receptor.active_restraints);
+            let perc_l = satisfied_restraints(iface_l, &self.ligand.active_restraints);
+            let intersection = membrane_intersection(iface_r, &self.receptor.membrane);
+            let penalty = if intersection > 0.0 { MEMBRANE_PENALTY_SCORE * intersection } else { 0.0 };
+            score + perc_r * score + perc_l * score - penalty
+        })
+    }
+}
+
+impl Score for CPYDOCK {
+    fn energy(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
     }
 }

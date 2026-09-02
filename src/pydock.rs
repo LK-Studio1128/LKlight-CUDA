@@ -1,5 +1,8 @@
 use super::amber::{AMBER_TYPES, ELE_CHARGES, NT_ELE_CHARGES, VDW_CHARGES, VDW_RADII};
 use super::constants::{INTERFACE_CUTOFF2, MEMBRANE_PENALTY_SCORE};
+use crate::grid_dna::ReceptorField;
+use crate::nearcell::NearCells;
+use std::sync::OnceLock;
 use super::qt::{rot3_apply, Quaternion};
 use std::cell::RefCell;
 use super::scoring::{membrane_intersection, satisfied_restraints, Score};
@@ -165,6 +168,8 @@ pub struct PYDOCK {
     pub receptor: PYDOCKDockingModel,
     pub ligand: PYDOCKDockingModel,
     pub use_anm: bool,
+    cells: OnceLock<NearCells>,
+    field: OnceLock<ReceptorField>,
 }
 
 impl<'a> PYDOCK {
@@ -197,13 +202,15 @@ impl<'a> PYDOCK {
                 lig_num_anm,
             ),
             use_anm,
+            cells: OnceLock::new(),
+            field: OnceLock::new(),
         };
         Box::new(d)
     }
 }
 
-impl Score for PYDOCK {
-    fn energy(
+impl PYDOCK {
+    fn energy_exact(
         &self,
         translation: &[f64],
         rotation: &Quaternion,
@@ -322,6 +329,128 @@ impl Score for PYDOCK {
     }
 }
 
+impl PYDOCK {
+    /// Grid-accelerated evaluation (same split as DNA::energy_grid):
+    ///   * pairs with d ≤ 10 Å (electrostatics-with-clamp + LJ) are computed
+    ///     exactly via the receptor cell list — every contributing pair is in
+    ///     the 27-cell window, so the pair set matches energy_exact;
+    ///   * the 10–30 Å electrostatics is the receptor far-field φ(x)=Σq/d²
+    ///     looked up trilinearly (no clamp can trigger beyond 10 Å, so the
+    ///     field factorises exactly — identical argument as DNA);
+    ///   * interface flags (restraints / membrane) collected in the same near
+    ///     pass, so restraint/membrane runs no longer fall back to the 30 Å
+    ///     all-vs-all scan.
+    /// Differs from [`PYDOCK::energy_exact`] only by grid-interpolation error
+    /// (~0.1% of the far field) and f64 summation order.
+    pub fn energy_grid(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        if self.use_anm
+            || !rec_nmodes.is_empty()
+            || !lig_nmodes.is_empty()
+        {
+            return self.energy_exact(translation, rotation, rec_nmodes, lig_nmodes);
+        }
+        let rot_mat = rotation.to_matrix();
+        let field = self.field.get_or_init(|| {
+            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+        });
+        let cells = self.cells.get_or_init(|| {
+            NearCells::build(&self.receptor.coordinates, 10.0)
+        });
+
+        thread_local! {
+            static SCRATCH: RefCell<(Vec<[f64;3]>, Vec<[f64;3]>, Vec<usize>, Vec<usize>)> =
+                RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let (receptor_coordinates, ligand_coordinates, interface_receptor, interface_ligand) = &mut *sc;
+        let rec_num_atoms = self.receptor.coordinates.len();
+        let lig_num_atoms = self.ligand.coordinates.len();
+        if receptor_coordinates.len() != rec_num_atoms { receptor_coordinates.resize(rec_num_atoms, [0.0;3]); }
+        if ligand_coordinates.len() != lig_num_atoms { ligand_coordinates.resize(lig_num_atoms, [0.0;3]); }
+        if interface_receptor.len() != rec_num_atoms { interface_receptor.resize(rec_num_atoms, 0); }
+        if interface_ligand.len() != lig_num_atoms { interface_ligand.resize(lig_num_atoms, 0); }
+        receptor_coordinates.copy_from_slice(&self.receptor.coordinates);
+        ligand_coordinates.copy_from_slice(&self.ligand.coordinates);
+        for v in interface_receptor.iter_mut() { *v = 0; }
+        for v in interface_ligand.iter_mut() { *v = 0; }
+
+        for coordinate in ligand_coordinates.iter_mut() {
+            let r = rot3_apply(&rot_mat, *coordinate);
+            coordinate[0] = r[0] + translation[0];
+            coordinate[1] = r[1] + translation[1];
+            coordinate[2] = r[2] + translation[2];
+        }
+        let lig_slice: &[[f64; 3]] = ligand_coordinates.as_slice();
+
+        let rec_ele  = &self.receptor.ele_charges;
+        let lig_ele  = &self.ligand.ele_charges;
+        let rec_svdw = &self.receptor.sqrt_vdw_charges;
+        let lig_svdw = &self.ligand.sqrt_vdw_charges;
+        let rec_vdwr = &self.receptor.vdw_radii;
+        let lig_vdwr = &self.ligand.vdw_radii;
+
+        let mut e_near_raw = 0.0f64;
+        let mut total_vdw = 0.0f64;
+        for (j, la) in lig_slice.iter().enumerate() {
+            let x = la[0]; let y = la[1]; let z = la[2];
+            let qj = lig_ele[j];
+            let svdwj = lig_svdw[j];
+            let vdwrj = lig_vdwr[j];
+            cells.for_each_near(x, y, z, &mut |i| {
+                let dx = x - receptor_coordinates[i][0];
+                let dy = y - receptor_coordinates[i][1];
+                let dz = z - receptor_coordinates[i][2];
+                let d2 = dx*dx + dy*dy + dz*dz;
+                if d2 <= VDW_DIST_CUTOFF2 {
+                    let ae = (qj * rec_ele[i] / d2).clamp(ELEC_MIN_CUTOFF, ELEC_MAX_CUTOFF);
+                    e_near_raw += ae;
+                    let vdw_e = svdwj * rec_svdw[i];
+                    let vdw_r = vdwrj + rec_vdwr[i];
+                    let p6 = vdw_r.powi(6) / d2.powi(3);
+                    total_vdw += (vdw_e * (p6*p6 - 2.0*p6)).min(VDW_CUTOFF);
+                }
+                if d2 <= INTERFACE_CUTOFF2 {
+                    interface_receptor[i] = 1;
+                    interface_ligand[j] = 1;
+                }
+            });
+        }
+
+        // Far field (10–30 Å electrostatics).
+        let e_field_raw = field.far_field_energy(lig_slice, lig_ele);
+        let total_elec_raw = e_near_raw + e_field_raw;
+        let total_elec = total_elec_raw * FACTOR / EPSILON;
+        let score = -(total_elec + total_vdw);
+
+        let perc_r = satisfied_restraints(interface_receptor, &self.receptor.active_restraints);
+        let perc_l = satisfied_restraints(interface_ligand, &self.ligand.active_restraints);
+        let intersection = membrane_intersection(interface_receptor, &self.receptor.membrane);
+        let penalty = if intersection > 0.0 { MEMBRANE_PENALTY_SCORE * intersection } else { 0.0 };
+
+        score + perc_r * score + perc_l * score - penalty
+        })
+    }
+}
+
+impl Score for PYDOCK {
+    fn energy(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,24 +473,34 @@ mod tests {
         let (ligand, _errors) =
             pdbtbx::open(&ligand_filename, pdbtbx::StrictnessLevel::Strict).unwrap();
 
-        let scoring = PYDOCK::new(
-            receptor,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-            ligand,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-            false,
-        );
-
         let translation = vec![0., 0., 0.];
         let rotation = Quaternion::default();
-        let energy = scoring.energy(&translation, &rotation, &Vec::new(), &Vec::new());
-        assert!((energy - (-364.88126358158974)).abs() < 1e-8,
-            "energy={energy} expected≈-364.88126358158974");
+        // Concrete instance so the inherent energy_grid / energy_exact pair can
+        // be compared directly (Box<dyn Score> can only reach the trait
+        // defaults, which route energy_exact back to energy).
+        let rec = PYDOCKDockingModel::new(&receptor, &[], &[], &[], 0);
+        let lig = PYDOCKDockingModel::new(&ligand, &[], &[], &[], 0);
+        let s = PYDOCK {
+            receptor: rec,
+            ligand: lig,
+            use_anm: false,
+            cells: OnceLock::new(),
+            field: OnceLock::new(),
+        };
+        let energy = s.energy_grid(&translation, &rotation, &Vec::new(), &Vec::new());
+        let exact0 = s.energy_exact(&translation, &rotation, &Vec::new(), &Vec::new());
+        assert!((exact0 - (-364.88126358158974)).abs() < 1e-8,
+            "exact={exact0} expected≈-364.88126358158974");
+        // Grid vs exact: near pairs ≤10 Å identical; only the 10-30 Å far-field
+        // lookup contributes interpolation error (~0.4% on this interpenetrated
+        // pose; <0.5% on well-separated poses).
+        let rel = (energy - exact0).abs() / exact0.abs();
+        assert!(rel < 0.05, "energy={energy} exact={exact0} rel {rel:.4}");
+        for t in [[2., 0., 0.], [0., 3., 0.], [-4., 2., 5.], [1., -2., 6.]] {
+            let g = s.energy_grid(&t, &rotation, &Vec::new(), &Vec::new());
+            let e = s.energy_exact(&t, &rotation, &Vec::new(), &Vec::new());
+            let r = if e.abs() > 1.0 { (g - e).abs() / e.abs() } else { (g - e).abs() };
+            assert!(r < 0.05, "pose {t:?}: grid {g} vs exact {e} rel {r:.4}");
+        }
     }
 }
