@@ -165,3 +165,41 @@ gpu    7.7 s（N=20）/ 9.1 s（N=1000）—— N=1000 相对 exact 外推 ~389�
 | steps ↑ | GSO 顺序迭代无法并行 | 可选收敛早停（luciferin 平稳即止），需算法验证 |
 
 **下一步建议（按性价比）**：① energy_grid 推广到 vdw/pydock/cpydock（大体系 6-13×）；② restraints/膜 复用 cell 近距界面收集（~10×）；③ 集成层 swarm 多进程并行（立即可得 ~4-8×）；④ ANM 惰性重建场（低优先级）。
+
+
+---
+
+## 八、v4：全原子评分函数全量加速 + restraints/膜 上网格 + swarm 并行（2026-09-03）
+
+### 1. vdw / pydock / cpydock 网格加速（大体系 RNA 实测，20 glow × 100 步）
+
+| 函数 | 加速前 | 加速后 | 提速 | 数值精度（vs exact 同 pose） |
+|---|---|---|---|---|
+| vdw | 50.1 s | **1.04 s** | **48×** | 逐位一致（0.000；无远距项，cell 全覆盖） |
+| pydock | 114.1 s | **7.61 s** | **15×** | 0.13–0.27%（远距场插值） |
+| cpydock | 114.1 s | **9.72 s** | **11.7×** | 绝对差同 pydock（solv/min 精确；相对 2.5–4% 因能量标尺小） |
+
+实现：通用受体 cell list（nearcell.rs，10 Å cell、27-cell 窗口精确）+ 静电类复用 dna 的远距场（10–30 Å φ 查表；>10 Å clamp 不触发 → 线性分解精确）。cpydock 的接触-SASA 脱溶只需 6.4 Å 内最近重原子，落在 cell 窗口内 → solv 精确。
+
+### 2. dna restraints / 膜 分支上网格（不再回退 30 Å 全对）
+
+界面残基标记在 cell 近距扫描内收集（GPU kernel 不返回标记 → 约束/膜 run 用 CPU cell 路径）。带 restraints 同 seed run 验证：网格路径与精确路径收敛**完全一致**（best -1355.83 / med -1215.37 两版相同）。
+
+### 3. ANM 分支结论（保留精确路径，设计使然）
+
+受体每 pose 独立变形 → 任何静态场/cell 缓存每 pose 失效、需全量重建（每步 20 pose × 场重建 ≈ 秒级）→ 场加速不适用。ANM 场景多为小体系，精确路径可接受；此为记录在案的取舍而非遗漏。
+
+### 4. swarm 级并行工具（tools/run_parallel.py）
+
+S 个 swarm 完全独立 → P 进程并行。服务器实测 P4 = 8.5 s vs 串行 ~35 s（≈4× 线性）；本地 6/6 swarm 验证。用法：目录内含 setup.json + initial_positions_*.dat 时
+`python3 tools/run_parallel.py <engine> <steps> <method> [swarms] [parallel]`
+
+### 5. 累计效果（相对原始逐对 exact）
+
+| 阶段 | 版本 | 大体系单 swarm 参考 |
+|---|---|---|
+| 原始逐对 | exact | vdw 50 s / pydock-cpydock 114 s / dna ~55 s（Mac） |
+| v1–v3 | dna grid/GPU + 框架 | dna 3.1 s（Mac）/ 服务器 GPU 批量再快 |
+| **v4** | **全部全原子函数 + 约束/膜 + swarm 并行** | vdw 1.0 s / pydock 7.6 s / cpydock 9.7 s（服务器） |
+
+测试 32/32（vdw/pydock 多姿态一致断言、1AZP 回归、restraints 收敛对照）。
