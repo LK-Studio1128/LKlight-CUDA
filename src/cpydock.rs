@@ -675,3 +675,56 @@ impl Score for CPYDOCK {
         self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qt::Quaternion;
+    use std::env;
+
+    fn load_1azp() -> (PDB, PDB) {
+        let base = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        let (rec, _) = pdbtbx::open(
+            &format!("{}/tests/1azp/1azp_receptor.pdb", base),
+            pdbtbx::StrictnessLevel::Strict,
+        )
+        .unwrap();
+        let (lig, _) = pdbtbx::open(
+            &format!("{}/tests/1azp/1azp_ligand.pdb", base),
+            pdbtbx::StrictnessLevel::Strict,
+        )
+        .unwrap();
+        (rec, lig)
+    }
+
+    fn concrete(pdb_r: &PDB, pdb_l: &PDB) -> CPYDOCK {
+        let rec = CPYDOCKDockingModel::new(pdb_r, &[], &[], &[], 0);
+        let lig = CPYDOCKDockingModel::new(pdb_l, &[], &[], &[], 0);
+        CPYDOCK {
+            receptor: rec,
+            ligand: lig,
+            use_anm: false,
+            cells: OnceLock::new(),
+            field: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn grid_matches_exact() {
+        let (rec, lig) = load_1azp();
+        let s = concrete(&rec, &lig);
+        let q = Quaternion::default();
+        let t0 = vec![0., 0., 0.];
+        let g0 = s.energy_grid(&t0, &q, &[], &[]);
+        let e0 = s.energy_exact(&t0, &q, &[], &[]);
+        let d0 = (g0 - e0).abs();
+        assert!(d0 < 12.0, "t0: grid {g0} exact {e0} abs_diff {d0:.3}");
+        for t in [[2., 3., 1.], [-4., 5., 2.], [0., -6., 8.], [3., 3., -3.]] {
+            let g = s.energy_grid(&t, &q, &[], &[]);
+            let e = s.energy_exact(&t, &q, &[], &[]);
+            let d = (g - e).abs();
+            assert!(d < 12.0, "t {t:?}: grid {g} exact {e} abs_diff {d:.3}");
+        }
+    }
+}

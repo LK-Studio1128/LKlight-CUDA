@@ -110,3 +110,51 @@ impl NearCells {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_set_matches_allpairs() {
+        let mut rng = 7u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 200) as f64 / 10.0 - 10.0
+        };
+        let coords: Vec<[f64; 3]> = (0..300).map(|_| [next(), next(), next()]).collect();
+        let cell = 5.0f64;
+        let cut2 = cell * cell;
+        let nc = NearCells::build(&coords, cell);
+        let mut near: Vec<(usize, usize)> = Vec::new();
+        for (j, c) in coords.iter().enumerate() {
+            nc.for_each_near(c[0], c[1], c[2], &mut |i| {
+                let dx = c[0] - coords[i][0];
+                let dy = c[1] - coords[i][1];
+                let dz = c[2] - coords[i][2];
+                if i != j && dx * dx + dy * dy + dz * dz <= cut2 {
+                    near.push((i.min(j), i.max(j)));
+                }
+            });
+        }
+        near.sort_unstable();
+        near.dedup();
+        let mut all: Vec<(usize, usize)> = Vec::new();
+        for i in 0..coords.len() {
+            for j in (i + 1)..coords.len() {
+                let dx = coords[i][0] - coords[j][0];
+                let dy = coords[i][1] - coords[j][1];
+                let dz = coords[i][2] - coords[j][2];
+                if dx * dx + dy * dy + dz * dz <= cut2 {
+                    all.push((i, j));
+                }
+            }
+        }
+        assert_eq!(near.len(), all.len(),
+            "cell enumerated {} pairs, all-pairs {} (no miss/dup)",
+            near.len(), all.len());
+    }
+}

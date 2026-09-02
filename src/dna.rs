@@ -3,7 +3,7 @@ use super::qt::{rot3_apply, Quaternion};
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use super::scoring::{membrane_intersection, satisfied_restraints, Score};
-use crate::grid_dna::{ReceptorField, CLOSE_DIST, CLOSE_DIST2};
+use crate::grid_dna::{ReceptorField, CLOSE_DIST2};
 use crate::gpu_score::{full_energy_gpu, CudaReceptor};
 use pdbtbx::PDB;
 use std::collections::HashMap;
@@ -822,6 +822,16 @@ impl Score for DNA {
 
     fn supports_batch(&self) -> bool {
         if self.use_anm {
+            return false;
+        }
+        // Restraints / membrane need per-atom interface flags which the GPU
+        // batch kernel does not compute — the batched path would silently
+        // score without restraints. Keep those runs on the CPU grid path.
+        if !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty()
+        {
             return false;
         }
         *self
