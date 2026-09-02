@@ -7,6 +7,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cuda/far_field.cu");
+    println!("cargo:rerun-if-changed=src/cuda/full_score.cu");
     println!("cargo:rerun-if-changed=build.rs");
 
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
@@ -17,32 +18,37 @@ fn main() {
     // Locate nvcc (respect NVCC env override).
     let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
 
-    // out dir for the object + archive
+    // out dir for the objects + archive
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     std::fs::create_dir_all(&out_dir).unwrap();
-    let obj = out_dir.join("far_field.o");
     let lib = out_dir.join("libfarfield.a");
 
-    // Compile the kernel.
-    let status = Command::new(&nvcc)
-        .args(["-O3", "-arch=native", "-c"])
-        .arg("src/cuda/far_field.cu")
-        .arg("-o")
-        .arg(&obj)
-        .status()
-        .expect("failed to spawn nvcc — is the CUDA toolkit installed?");
-    if !status.success() {
-        panic!("nvcc failed to compile src/cuda/far_field.cu (status {status})");
+    // Compile every kernel under src/cuda/ with nvcc.
+    let mut objs: Vec<PathBuf> = Vec::new();
+    for src in ["src/cuda/far_field.cu", "src/cuda/full_score.cu"] {
+        let stem = src.rsplit('/').next().unwrap().replace(".cu", "");
+        let obj = out_dir.join(format!("{stem}.o"));
+        let status = Command::new(&nvcc)
+            .args(["-O3", "-arch=native", "-c"])
+            .arg(src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .expect("failed to spawn nvcc — is the CUDA toolkit installed?");
+        if !status.success() {
+            panic!("nvcc failed to compile {src} (status {status})");
+        }
+        objs.push(obj);
     }
 
-    // Archive it (ar, as used by the toolchain).
+    // Archive all objects (ar, as used by the toolchain).
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-    let status = Command::new(&ar)
-        .args(["crs"])
-        .arg(&lib)
-        .arg(&obj)
-        .status()
-        .expect("failed to spawn ar");
+    let mut cmd = Command::new(&ar);
+    cmd.args(["crs"]).arg(&lib);
+    for o in &objs {
+        cmd.arg(o);
+    }
+    let status = cmd.status().expect("failed to spawn ar");
     if !status.success() {
         panic!("ar failed to create {lib:?}");
     }

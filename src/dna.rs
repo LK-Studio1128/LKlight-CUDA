@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use super::scoring::{membrane_intersection, satisfied_restraints, Score};
 use crate::grid_dna::{ReceptorField, CLOSE_DIST, CLOSE_DIST2};
+use crate::gpu_score::{full_energy_gpu, CudaReceptor};
 use pdbtbx::PDB;
 use std::collections::HashMap;
 use log::warn;
@@ -404,6 +405,8 @@ pub struct DNA {
     /// Lazily-built receptor far-field grid (10-30 Å electrostatics) used by
     /// the grid-accelerated fast path. GPU-copy friendly (f32, contiguous).
     pub field: OnceLock<ReceptorField>,
+    /// Lazily-built receptor CUDA cell-list description (GPU near-pair scoring).
+    pub rec_cuda: OnceLock<CudaReceptor>,
 }
 
 impl<'a> DNA {
@@ -438,6 +441,7 @@ impl<'a> DNA {
             ),
             use_anm,
             field: OnceLock::new(),
+            rec_cuda: OnceLock::new(),
         };
         Box::new(d)
     }
@@ -669,6 +673,24 @@ impl DNA {
         lig_order.sort_unstable_by(|&a, &b| {
             lig_slice[a as usize][2].partial_cmp(&lig_slice[b as usize][2]).unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Full-pose GPU fast path: near pairs + far field in one kernel.
+        // Used only when no restraints/membrane need interface flags (those
+        // stay on the CPU grid path). Any CUDA failure falls back below.
+        let need_iface_pre = !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty();
+        if !need_iface_pre {
+            let field_g = self.field.get_or_init(|| {
+                ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+            });
+            let crec_g = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
+            if let Some((e_raw_g, v_g)) = full_energy_gpu(field_g, crec_g, lig_slice, &self.ligand) {
+                let total_elec_g = e_raw_g * FACTOR / EPSILON;
+                return -(total_elec_g + v_g);
+            }
+        }
 
         // Near-pair energies (exact), far-field electrostatic from the grid.
         let (e_near_raw, v_total) = rec_c.iter().enumerate()

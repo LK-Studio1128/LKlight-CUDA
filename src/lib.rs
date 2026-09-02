@@ -12,6 +12,7 @@ pub mod dfire2;
 pub mod dna;
 pub mod glowworm;
 pub mod gpu_field;
+pub mod gpu_score;
 pub mod grid_dna;
 pub mod lr_sasa;
 pub mod mj3h;
