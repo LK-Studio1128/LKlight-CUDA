@@ -28,6 +28,10 @@ env_logger = "0.11.3"
 name = "LKlight"
 path = "src/bin/lightdock.rs"
 
+[features]
+default = []
+cuda = []
+
 [lints.clippy]
 borrowed_box = "allow"
 needless_range_loop = "allow"

@@ -1,7 +1,9 @@
 use super::constants::{INTERFACE_CUTOFF2, MEMBRANE_PENALTY_SCORE};
 use super::qt::{rot3_apply, Quaternion};
 use std::cell::RefCell;
+use std::sync::OnceLock;
 use super::scoring::{membrane_intersection, satisfied_restraints, Score};
+use crate::grid_dna::{ReceptorField, CLOSE_DIST, CLOSE_DIST2};
 use pdbtbx::PDB;
 use std::collections::HashMap;
 use log::warn;
@@ -399,6 +401,9 @@ pub struct DNA {
     pub receptor: DNADockingModel,
     pub ligand: DNADockingModel,
     pub use_anm: bool,
+    /// Lazily-built receptor far-field grid (10-30 Å electrostatics) used by
+    /// the grid-accelerated fast path. GPU-copy friendly (f32, contiguous).
+    pub field: OnceLock<ReceptorField>,
 }
 
 impl<'a> DNA {
@@ -432,13 +437,17 @@ impl<'a> DNA {
                 lig_num_anm,
             ),
             use_anm,
+            field: OnceLock::new(),
         };
         Box::new(d)
     }
 }
 
-impl Score for DNA {
-    fn energy(
+impl DNA {
+    /// Exact per-pair reference implementation (AMBER94 pair loop with the 1-D
+    /// Z-window acceleration). Kept for numerical cross-checks against the
+    /// grid-accelerated [`DNA::energy_grid`] path (see grid_dna.rs).
+    pub fn energy_exact(
         &self,
         translation: &[f64],
         rotation: &Quaternion,
@@ -592,6 +601,197 @@ impl Score for DNA {
     }
 }
 
+impl DNA {
+    /// Grid-accelerated energy (fast path, L1 of the GPU plan):
+    ///   * exact per-pair terms (clamped electrostatics + LJ + clash penalty)
+    ///     are evaluated only for pairs with d ≤ 10 Å (Z-window shrunk to ±10 Å);
+    ///   * the 10-30 Å electrostatics is a receptor far-field φ(x)=Σ q_i/d² on a
+    ///     1 Å grid, looked up by trilinear interpolation (no clamp can trigger
+    ///     beyond 10 Å, so the field factorises exactly);
+    ///   * interface flags (restraints / membrane) are collected in a cheap
+    ///     near-window pass only when restraints or a membrane are actually set.
+    ///
+    /// Returns the exact same score semantics as [`DNA::energy_exact`] (the two
+    /// differ only by grid-interpolation error, ~0.1-0.5% of the far field).
+    pub fn energy_grid(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        // ANM deforms the receptor so the static field would be stale → exact path.
+        if self.use_anm
+            || !rec_nmodes.is_empty()
+            || !lig_nmodes.is_empty()
+        {
+            return self.energy_exact(translation, rotation, rec_nmodes, lig_nmodes);
+        }
+        thread_local! {
+            static SCRATCH_G: RefCell<(Vec<[f64;3]>, Vec<[f64;3]>, Vec<usize>, Vec<usize>)> =
+                RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        let rot_mat = rotation.to_matrix();
+
+        SCRATCH_G.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let (rec_c, lig_c, iface_r, iface_l) = &mut *sc;
+        let rec_num_atoms = self.receptor.coordinates.len();
+        let lig_num_atoms = self.ligand.coordinates.len();
+        if rec_c.len() != rec_num_atoms { rec_c.resize(rec_num_atoms, [0.0;3]); }
+        if lig_c.len() != lig_num_atoms { lig_c.resize(lig_num_atoms, [0.0;3]); }
+        if iface_r.len() != rec_num_atoms { iface_r.resize(rec_num_atoms, 0); }
+        if iface_l.len() != lig_num_atoms { iface_l.resize(lig_num_atoms, 0); }
+        rec_c.copy_from_slice(&self.receptor.coordinates);
+        lig_c.copy_from_slice(&self.ligand.coordinates);
+        for v in iface_r.iter_mut() { *v = 0; }
+        for v in iface_l.iter_mut() { *v = 0; }
+
+        for (_, coordinate) in lig_c.iter_mut().enumerate() {
+            let r = rot3_apply(&rot_mat, *coordinate);
+            coordinate[0] = r[0] + translation[0];
+            coordinate[1] = r[1] + translation[1];
+            coordinate[2] = r[2] + translation[2];
+        }
+
+        let rec_ele  = &self.receptor.ele_charges;
+        let lig_ele  = &self.ligand.ele_charges;
+        let rec_svdw = &self.receptor.sqrt_vdw_charges;
+        let lig_svdw = &self.ligand.sqrt_vdw_charges;
+        let rec_vdwr = &self.receptor.vdw_radii;
+        let lig_vdwr = &self.ligand.vdw_radii;
+        let rec_heavy = &self.receptor.heavy;
+        let lig_heavy = &self.ligand.heavy;
+        let lig_slice: &[[f64; 3]] = lig_c.as_slice();
+
+        // Z-sorted ligand index (window ±CLOSE_DIST=10 Å for near pairs).
+        let mut lig_order: Vec<u32> = (0..lig_slice.len() as u32).collect();
+        lig_order.sort_unstable_by(|&a, &b| {
+            lig_slice[a as usize][2].partial_cmp(&lig_slice[b as usize][2]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Near-pair energies (exact), far-field electrostatic from the grid.
+        let (e_near_raw, v_total) = rec_c.iter().enumerate()
+            .map(|(i, ra)| {
+                let rx = ra[0]; let ry = ra[1]; let rz = ra[2];
+                let mut ei = 0.0f64;
+                let mut vi = 0.0f64;
+                let zlo = rz - CLOSE_DIST;
+                let zhi = rz + CLOSE_DIST;
+                let mut lo = lig_order.partition_point(|&j| lig_slice[j as usize][2] < zlo);
+                let hi = lig_order.partition_point(|&j| lig_slice[j as usize][2] <= zhi);
+                while lo < hi {
+                    let j = lig_order[lo] as usize;
+                    lo += 1;
+                    let la = &lig_slice[j];
+                    let dx = rx - la[0];
+                    let dy = ry - la[1];
+                    let dz = rz - la[2];
+                    let d2 = dx*dx + dy*dy + dz*dz;
+                    if d2 <= CLOSE_DIST2 {
+                        let ae = (rec_ele[i] * lig_ele[j] / d2)
+                            .clamp(ELEC_MIN_CUTOFF, ELEC_MAX_CUTOFF);
+                        ei += ae;
+                    }
+                    if d2 <= VDW_DIST_CUTOFF2 {
+                        let vdw_e = rec_svdw[i] * lig_svdw[j];
+                        let vdw_r = rec_vdwr[i] + lig_vdwr[j];
+                        let p6 = vdw_r.powi(6) / d2.powi(3);
+                        let mut v_pair = (vdw_e * (p6*p6 - 2.0*p6)).min(VDW_CUTOFF);
+                        if rec_heavy[i] && lig_heavy[j] {
+                            let d = d2.sqrt();
+                            let dmin = CLASH_PENALTY_FRAC * vdw_r;
+                            if d < dmin {
+                                v_pair += CLASH_PENALTY_W * (dmin - d);
+                            }
+                        }
+                        vi += v_pair;
+                    }
+                }
+                (ei, vi)
+            })
+            .fold((0.0, 0.0), |(e1, v1), (e2, v2)| (e1+e2, v1+v2));
+
+        // Far field: build once, then Σ_j q_j·φ(x_j) — GPU first (feature `cuda`),
+        // transparent CPU fallback.
+        let field = self.field.get_or_init(|| {
+            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+        });
+        let e_field_raw = crate::gpu_field::far_field_energy_gpu(field, lig_slice, lig_ele)
+            .unwrap_or_else(|| field.far_field_energy(lig_slice, lig_ele));
+
+        let total_elec_raw = e_near_raw + e_field_raw;
+        let total_elec = total_elec_raw * FACTOR / EPSILON;
+        let score = -(total_elec + v_total);
+
+        // Restraints / membrane need interface flags → cheap near-window pass.
+        let need_iface = !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty();
+        if need_iface {
+            for (i, ra) in rec_c.iter().enumerate() {
+                let zlo = ra[2] - CLOSE_DIST;
+                let zhi = ra[2] + CLOSE_DIST;
+                let mut lo = lig_order.partition_point(|&j| lig_slice[j as usize][2] < zlo);
+                let hi = lig_order.partition_point(|&j| lig_slice[j as usize][2] <= zhi);
+                while lo < hi {
+                    let j = lig_order[lo] as usize;
+                    lo += 1;
+                    let la = &lig_slice[j];
+                    let d2 = (ra[0]-la[0]).powi(2) + (ra[1]-la[1]).powi(2) + (ra[2]-la[2]).powi(2);
+                    if d2 <= INTERFACE_CUTOFF2 {
+                        iface_r[i] = 1;
+                        iface_l[j] = 1;
+                    }
+                }
+            }
+            let perc_r = satisfied_restraints(iface_r, &self.receptor.active_restraints);
+            let perc_l = satisfied_restraints(iface_l, &self.ligand.active_restraints);
+            let intersection = membrane_intersection(iface_r, &self.receptor.membrane);
+            let penalty = if intersection > 0.0 { MEMBRANE_PENALTY_SCORE * intersection } else { 0.0 };
+            score + perc_r * score + perc_l * score - penalty
+        } else {
+            score
+        }
+        })
+    }
+}
+
+impl Score for DNA {
+    fn energy(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        // This CUDA branch defaults to the grid-accelerated fast path; the exact
+        // pair loop stays available as DNA::energy_exact for verification.
+        self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
+    }
+
+    fn energy_exact(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        DNA::energy_exact(self, translation, rotation, rec_nmodes, lig_nmodes)
+    }
+
+    fn energy_grid(
+        &self,
+        translation: &[f64],
+        rotation: &Quaternion,
+        rec_nmodes: &[f64],
+        lig_nmodes: &[f64],
+    ) -> f64 {
+        DNA::energy_grid(self, translation, rotation, rec_nmodes, lig_nmodes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,9 +832,36 @@ mod tests {
         let rotation = Quaternion::default();
         let energy = scoring.energy(&translation, &rotation, &Vec::new(), &Vec::new());
         // 注：该固定位姿受体-配体原子最近距离仅 ~0.3Å（互相穿插）。重原子线性 clash
-        // 罚（0.75×vdW和以下每Å +2.0）对该位姿的深穿透正确追加惩罚，期望能量随之下调
-        // （原 -365 → 现 -647）；normal 表面采样对接不受影响。
-        assert!((energy - (-1210.8634886648877)).abs() < 1e-6,
-            "energy={energy} expected≈-1210.8634886648877");
+        // 罚（0.75×vdW和以下每Å +6.0）对该位姿的深穿透正确追加惩罚。此分支默认走
+        // 网格快速路径（energy_grid），期望值为 grid 版（vs 精确版 -1210.8634 差 0.12%）。
+        assert!((energy - (-1212.3778353462812)).abs() < 1e-6,
+            "energy={energy} expected≈-1212.3778353462812");
+    }
+
+    #[test]
+    fn test_1azp_grid_matches_exact() {
+        // The grid-accelerated path must agree with the exact per-pair loop to
+        // within interpolation tolerance on the same pose.
+        let cargo_path = match env::var("CARGO_MANIFEST_DIR") {
+            Ok(val) => val,
+            Err(_) => String::from("."),
+        };
+        let test_path: String = format!("{}/tests/1azp", cargo_path);
+        let (receptor, _) =
+            pdbtbx::open(&format!("{}/1azp_receptor.pdb", test_path), pdbtbx::StrictnessLevel::Strict).unwrap();
+        let (ligand, _) =
+            pdbtbx::open(&format!("{}/1azp_ligand.pdb", test_path), pdbtbx::StrictnessLevel::Strict).unwrap();
+        let scoring = DNA::new(
+            receptor, Vec::new(), Vec::new(), Vec::new(), 0,
+            ligand, Vec::new(), Vec::new(), Vec::new(), 0, false,
+        );
+        let rotation = Quaternion::default();
+        for (tx, ty, tz) in [(0.0, 0.0, 0.0), (1.0, 2.0, 3.0), (-2.0, 1.0, -4.0), (5.0, -3.0, 2.0)] {
+            let tr = vec![tx, ty, tz];
+            let exact = scoring.energy_exact(&tr, &rotation, &Vec::new(), &Vec::new());
+            let grid = scoring.energy_grid(&tr, &rotation, &Vec::new(), &Vec::new());
+            let rel = (exact - grid).abs() / exact.abs().max(1.0);
+            assert!(rel < 0.02, "pose ({tx},{ty},{tz}): exact={exact} grid={grid} rel={rel:.4} (>2%)");
+        }
     }
 }
