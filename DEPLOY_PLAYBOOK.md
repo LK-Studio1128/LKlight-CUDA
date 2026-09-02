@@ -52,7 +52,7 @@ LKlight score rec.pdb lig.pdb dna --tx 0 --ty 0 --tz 0
 |---|---|
 | 原始逐对打分 | 55.3 s（Mac 8 核参考） |
 | CPU grid（L1） | 7.9 s（Mac）/ 16.1 s（服务器 12 核）→ **7×** |
-| CUDA far-field | 15.9 s（与 CPU grid 持平；批处理场景见 GPU_ACCEL_DESIGN.md 下一步） |
+| **CUDA batch（近距+远距一次 kernel）** | **7.77 s（服务器 3080 Ti）→ 较 CPU grid 再快 2.07×** |
 
 ## 六、评分函数覆盖说明
 
