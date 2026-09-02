@@ -64,6 +64,12 @@ pub fn far_field_energy_gpu(
         )
     };
     if ret == 0 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("[gpu_field] CUDA far-field ACTIVE (grid {}x{}x{}, {} lig atoms)",
+                      field.n[0], field.n[1], field.n[2], n);
+        }
         Some(result)
     } else {
         None

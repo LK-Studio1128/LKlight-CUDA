@@ -49,6 +49,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=farfield");
+    // nvcc emits C++-flavoured objects (device stubs use __cxa_guard /
+    // __gxx_personality) → link the C++ runtime too.
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 
     // cudart lives next to nvcc (nvcc/../lib64 or lib).
     if let Ok(nvcc_path) = Command::new(&nvcc).arg("--version").status() {
