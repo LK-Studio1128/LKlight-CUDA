@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.1] — 2026-11-21
+
+### Fixed
+- Reject incompatible scoring methods for nucleic-acid inputs instead of
+  emitting a constant zero score.
+- Propagate worker failures to the process exit status.
+- Align the CUDA DNA regression tolerance with the grid implementation.
+
 ## [1.1.0] — 2026-08-29
 
 ### Fixed (found during multi-scenario testing, 2026-08-29)
