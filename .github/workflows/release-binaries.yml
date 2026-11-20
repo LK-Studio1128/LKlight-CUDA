@@ -34,6 +34,7 @@ jobs:
           cuda: '13.2.0'
           method: network
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --features cuda
       - uses: actions/upload-artifact@v4
@@ -42,18 +43,14 @@ jobs:
           path: target/release/LKlight.exe
           if-no-files-found: error
 
-  mac-metal:
+  mac-cpu:
     runs-on: macos-latest
-    env:
-      CUDA_ARCH: sm_80
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
-      - run: cargo build --release --features metal
-      - run: cp target/release/LKlight target/release/LKlight-metal
       - uses: actions/upload-artifact@v4
         with:
-          name: LKlight-CUDA-macos-metal
-          path: target/release/LKlight-metal
+          name: LKlight-CUDA-macos-cpu
+          path: target/release/LKlight
           if-no-files-found: error
