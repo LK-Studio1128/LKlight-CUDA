@@ -4,15 +4,16 @@
 
 ## Fixed
 
-- Nucleic-acid inputs reject unsupported scoring functions with a clear error
-  and exit code 2 instead of returning a constant zero score.
+- Nucleic-acid inputs allow `dna`, `ddna`, `pydock`, `cpydock`, and `vdw`;
+  unsupported amino-acid-only/statistical functions fail with exit code 2
+  instead of returning a constant zero score.
 - Worker-thread failures are reflected in the process exit status.
 - The CUDA DNA regression uses a relative tolerance appropriate for the grid
   path.
 
 ## Validation
 
-- `cargo test --release --lib`: **34 passed** on the CPU fallback build.
+- `cargo test --release --lib`: **36 passed** on the CPU fallback build.
 - Real protein–DNA regression: macOS CPU fallback **-5192.292247**; Linux CUDA
   **-5192.291734** with CUDA batching active.
 - A 1×20×20 Linux CUDA docking produced ranked scores **39.606634–49.655229**

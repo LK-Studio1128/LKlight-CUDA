@@ -11,8 +11,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [1.1.1] — 2026-11-21
 
 ### Fixed
-- Reject incompatible scoring methods for nucleic-acid inputs instead of
-  emitting a constant zero score.
+- Reject incompatible scoring methods for nucleic-acid inputs while retaining
+  `dna`, `ddna`, `pydock`, `cpydock`, and `vdw`; unsupported methods no longer
+  emit a constant zero score.
 - Propagate worker failures to the process exit status.
 - Align the CUDA DNA regression tolerance with the grid implementation.
 
